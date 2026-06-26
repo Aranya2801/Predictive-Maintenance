@@ -1,0 +1,147 @@
+schema: '2.0'
+
+stages:
+
+  # ── Stage 1: Download raw datasets ──────────────────────────────────────────
+  download_cmapss:
+    cmd: python scripts/data/download_datasets.py --dataset cmapss --output data/raw/cmapss/
+    deps:
+      - scripts/data/download_datasets.py
+    outs:
+      - data/raw/cmapss/
+    desc: "Download NASA C-MAPSS turbofan dataset"
+
+  download_ai4i:
+    cmd: python scripts/data/download_datasets.py --dataset ai4i --output data/raw/ai4i/
+    deps:
+      - scripts/data/download_datasets.py
+    outs:
+      - data/raw/ai4i/
+    desc: "Download AI4I 2020 predictive maintenance dataset"
+
+  generate_synthetic:
+    cmd: >
+      python scripts/data/generate_synthetic_data.py
+      --machines 200
+      --days 365
+      --fault-rate 0.4
+      --output data/raw/synthetic/fleet_data.parquet
+      --seed 42
+    deps:
+      - scripts/data/generate_synthetic_data.py
+    outs:
+      - data/raw/synthetic/fleet_data.parquet
+    desc: "Generate 200-machine synthetic fleet dataset"
+
+  # ── Stage 2: Validate data ───────────────────────────────────────────────────
+  validate_data:
+    cmd: python scripts/data/validate_data.py --input data/raw/ --output data/validation_report.json
+    deps:
+      - scripts/data/validate_data.py
+      - data/raw/
+    outs:
+      - data/validation_report.json
+    desc: "Run Great Expectations data quality checks"
+
+  # ── Stage 3: Feature engineering ────────────────────────────────────────────
+  engineer_features_cmapss:
+    cmd: >
+      python scripts/data/engineer_features.py
+      --input data/raw/cmapss/
+      --output data/processed/cmapss_features.parquet
+      --config ml/configs/feature_engineering.yaml
+    deps:
+      - scripts/data/engineer_features.py
+      - ml/training/feature_engineering.py
+      - data/raw/cmapss/
+      - ml/configs/feature_engineering.yaml
+    outs:
+      - data/processed/cmapss_features.parquet
+    desc: "Engineer features from C-MAPSS dataset"
+
+  engineer_features_synthetic:
+    cmd: >
+      python scripts/data/engineer_features.py
+      --input data/raw/synthetic/fleet_data.parquet
+      --output data/processed/synthetic_features.parquet
+      --config ml/configs/feature_engineering.yaml
+    deps:
+      - scripts/data/engineer_features.py
+      - ml/training/feature_engineering.py
+      - data/raw/synthetic/fleet_data.parquet
+    outs:
+      - data/processed/synthetic_features.parquet
+    desc: "Engineer features from synthetic dataset"
+
+  # ── Stage 4: Train models ────────────────────────────────────────────────────
+  train_ensemble:
+    cmd: >
+      python ml/pipelines/train_pipeline.py
+      --config ml/configs/production.yaml
+      --dataset data/processed/synthetic_features.parquet
+      --ensemble-only
+      --device cpu
+    deps:
+      - ml/pipelines/train_pipeline.py
+      - ml/models/ensemble/gradient_boosting_ensemble.py
+      - ml/configs/production.yaml
+      - data/processed/synthetic_features.parquet
+    outs:
+      - ml/model_registry/ensemble/
+    metrics:
+      - ml/model_registry/ensemble/metrics.json:
+          cache: false
+    desc: "Train XGBoost + LightGBM + CatBoost stacking ensemble"
+
+  train_lstm_ae:
+    cmd: >
+      python ml/pipelines/train_pipeline.py
+      --config ml/configs/production.yaml
+      --dataset data/processed/synthetic_features.parquet
+      --no-ensemble
+      --device cpu
+    deps:
+      - ml/pipelines/train_pipeline.py
+      - ml/models/autoencoder/lstm_autoencoder.py
+      - ml/configs/production.yaml
+      - data/processed/synthetic_features.parquet
+    outs:
+      - ml/model_registry/lstm_ae_best.pt
+    metrics:
+      - ml/model_registry/lstm_ae_metrics.json:
+          cache: false
+    desc: "Train LSTM AutoEncoder for anomaly detection"
+
+  # ── Stage 5: Evaluate models ─────────────────────────────────────────────────
+  evaluate_models:
+    cmd: >
+      python scripts/deployment/evaluate_models.py
+      --ensemble-path ml/model_registry/ensemble/
+      --ae-path ml/model_registry/lstm_ae_best.pt
+      --test-data data/processed/synthetic_features.parquet
+      --output ml/model_registry/evaluation_report.json
+    deps:
+      - scripts/deployment/evaluate_models.py
+      - ml/model_registry/ensemble/
+      - ml/model_registry/lstm_ae_best.pt
+      - data/processed/synthetic_features.parquet
+    metrics:
+      - ml/model_registry/evaluation_report.json:
+          cache: false
+    desc: "Evaluate all models on held-out test set"
+
+  # ── Stage 6: Export for edge ─────────────────────────────────────────────────
+  export_tflite:
+    cmd: >
+      python scripts/deployment/export_tflite.py
+      --model-path ml/model_registry/lstm_ae_best.pt
+      --output edge/raspberry_pi/models/anomaly_detector_int8.tflite
+      --quantize int8
+      --calibration-data data/processed/synthetic_features.parquet
+    deps:
+      - scripts/deployment/export_tflite.py
+      - ml/model_registry/lstm_ae_best.pt
+      - data/processed/synthetic_features.parquet
+    outs:
+      - edge/raspberry_pi/models/anomaly_detector_int8.tflite
+    desc: "Export INT8 quantized TFLite model for Raspberry Pi"
